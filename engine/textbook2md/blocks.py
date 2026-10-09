@@ -111,16 +111,23 @@ def remove_running(ctx: BuildCtx) -> dict:
     local = {p for p, c in cnt.items() if c >= thresh and p}
     patterns = set(ctx.running_patterns) | local
     removed = []
+    from .layout import reorder_page
     for pg in pages:
-        keep = []
+        keep, changed = [], False
         for it in pg["items"]:
             if it["t"] == "line" and it.get("zone"):
                 pat = norm_pattern(it["raw"])
                 if pat in patterns or re.fullmatch(r"(page\s*)?#+", pat) or re.fullmatch(r"[ivxlc]+", pat):
                     removed.append({"page": pg["page"], "bbox": it["bbox"], "text": it["raw"]})
                     continue
+                # a margin-zone line that is not a running header/footer is ordinary content (e.g. a
+                # footnote or a body line close to the page edge): put it back into the reading flow
+                it["zone"] = None
+                changed = True
             keep.append(it)
         pg["items"] = keep
+        if changed:
+            reorder_page(pg)
     return {"removed": removed, "local_patterns": sorted(local)}
 
 
@@ -215,7 +222,7 @@ def segment(ctx: BuildCtx, stats: dict) -> list:
             if not brk:
                 same_col_page = prev_page == page and prev["col"] == it["col"]
                 size_d = abs(it["size"] - prev["size"])
-                if mk and not (prev_marker_cont(prev, it, mk)):
+                if mk:
                     brk = True
                 elif size_d > 0.7:
                     brk = True
@@ -259,10 +266,6 @@ def segment(ctx: BuildCtx, stats: dict) -> list:
             prev, prev_page = it, page
     close()
     return stream
-
-
-def prev_marker_cont(prev, it, mk) -> bool:
-    return False
 
 
 def finish_para(p: Para, vocab: Vocab, tag_pages=True) -> None:
@@ -372,20 +375,13 @@ def assign_levels(heads: list[Para], memory: dict, title_para_ids: set, body: fl
         styles.setdefault(key, (p.size, p.bold))
     order = sorted(styles.items(), key=lambda kv: (-kv[1][0], not kv[1][1]))
     levels: dict[str, int] = {}
-    for key, (sz, b) in order:
-        if key in mem:
+    prev_level = 1
+    for key, _ in order:
+        if key in mem:                                   # conversion memory wins (same book → same styles)
             levels[key] = mem[key]
-    for key, (sz, b) in order:
-        if key in levels:
-            continue
-        larger = [(k, levels[k]) for k, (s2, _) in order if k in levels and s2 > sz]
-        levels[key] = (max(l for _, l in larger) + 1) if larger else 2
-        # never collide with a known larger style
-    # enforce monotonic non-decreasing level for decreasing size
-    last = 1
-    for key, (sz, b) in order:
-        levels[key] = max(levels[key], last if key not in mem else levels[key])
-        last = levels[key] if key in mem else min(levels[key], last + 1)
+        else:                                            # dense ranking below the nearest larger style
+            levels[key] = max(2, min(prev_level + 1, 4)) if prev_level >= 2 else 2
+        prev_level = levels[key]
     for key, lvl in levels.items():
         mem[key] = min(lvl, 4)
     for p in heads:
@@ -474,11 +470,6 @@ def render_table(t: dict) -> tuple[str, str]:
 
 
 def merge_continued_tables(stream: list) -> list:
-    out: list = []
-    for el in stream:
-        if (el[0] == "table" and out and out[-1][0] == "table" and False):
-            pass
-        out.append(el)
     # page-spanning continuation: table (last of page p) + table (first of page p+1)
     merged: list = []
     for i, el in enumerate(stream):
@@ -614,6 +605,9 @@ def build_blocks(ctx: BuildCtx) -> dict:
             finish_para(el[1], ctx.vocab)
     # --- heading candidates
     paras = [e[1] for e in stream if e[0] == "para"]
+    join_stats = {"dehyphenated": sum(len(p.log.dehyphenated) for p in paras),
+                  "kept": sum(len(p.log.kept_hyphen) for p in paras),
+                  "uncertain": sum(len(p.log.uncertain) for p in paras)}
     for p in paras:
         p.h_conf = heading_conf(p, body)
     # --- chapter title (H1) on first page
@@ -728,7 +722,6 @@ def build_blocks(ctx: BuildCtx) -> dict:
             seq.append(("block", b))
         ref_entries = []
 
-    heading_seen = False
     for el in stream:
         if el[0] != "para":
             flush_list()
@@ -739,13 +732,10 @@ def build_blocks(ctx: BuildCtx) -> dict:
         if p.h_conf == -1.0:
             continue
         is_head = id(p) in title_ids or p.h_conf >= 0.6
-        if is_head and not (refs_mode and p.h_level > refs_level and False):
+        if is_head:
             flush_list()
             flush_refs()
             lvl = 1 if id(p) in title_ids else max(p.h_level, 2)
-            if id(p) not in title_ids and heading_seen is False and not title_ids and lvl == 2 and False:
-                pass
-            heading_seen = True
             hs = [Span(s.text, s.bits & ~BOLD) for s in p.spans]
             if hs and all(s.bits & ITALIC for s in hs if s.text.strip()):
                 hs = [Span(s.text, s.bits & ~ITALIC) for s in hs]
@@ -763,7 +753,6 @@ def build_blocks(ctx: BuildCtx) -> dict:
             continue
         if refs_mode:
             if p.kind == "list":
-                flush_refs_item = True
                 ref_entries.append(p)
             elif ref_entries and not ends_sentence(ref_entries[-1].text) and not re.match(r"^\s*\[?\d", p.text):
                 last = ref_entries[-1]
@@ -884,9 +873,8 @@ def build_blocks(ctx: BuildCtx) -> dict:
                                                f"![Scanned page {page}]({asset_dir_rel}/{fname})",
                               raw="", clean="", pages=[page], bboxes=[{"page": page, "bbox": it["bbox"]}], conf=0.0)
                 b.extra = {"asset_src": it["tmp"], "asset_name": fname, "scanned": True}
-                sev_msg = "OCR unavailable or failed" if True else ""
                 ctx.issue("HIGH", "PAGE_UNREADABLE",
-                          f"Page {page} has no native text and could not be OCR-read ({sev_msg}); page image kept as figure.",
+                          f"Page {page} has no native text and could not be OCR-read (OCR unavailable or failed); page image kept as figure.",
                           page, cat="ocr")
                 out.append(b)
                 continue
@@ -928,7 +916,6 @@ def build_blocks(ctx: BuildCtx) -> dict:
                     seq[j][1].pages[0] == (it.get("pages") or [page])[-1] and seq[j][1].bboxes and \
                     seq[j][1].bboxes[0]["bbox"][1] - it["bbox"][3] < 40 and len(notes) < 4:
                 nb = seq[j][1]
-                pp = None
                 # footnote-like: smaller than body text
                 sz = next((pr.size for pr in paras if pr.text == nb.clean), body)
                 if sz < body - 0.5:
@@ -990,7 +977,7 @@ def build_blocks(ctx: BuildCtx) -> dict:
     out = group_callouts(out, ctx, pages_by_no)
     for n, b in enumerate(out, 1):
         b.id = f"{ch['key']}-b{n:04d}"
-    return {"blocks": out, "labels": labels, "removed": cleanup["removed"], "stats": stats,
+    return {"blocks": out, "labels": labels, "removed": cleanup["removed"], "stats": stats, "join": join_stats,
             "title_para": title_text, "n_tables": tbl_n, "n_figures": fig_n}
 
 

@@ -100,7 +100,12 @@ def convert_chapter(project: Project, key: str, settings: dict | None = None, ct
         project.update_chapter_state(key, status=FAILED, error=str(e), stage="Failed")
         raise
     except Exception as e:  # never crash silently
-        project.update_chapter_state(key, status=FAILED, error=f"{type(e).__name__}: {e}", stage="Failed",
+        msg = f"{type(e).__name__}: {e}"
+        if isinstance(e, OSError) and e.errno == 28:
+            msg = "Disk full while writing the project. Free some space (or choose another output folder) and press Resume — finished pages are kept."
+        elif isinstance(e, PermissionError):
+            msg = f"Permission denied writing to the project folder: {e}"
+        project.update_chapter_state(key, status=FAILED, error=msg, stage="Failed",
                                      traceback=traceback.format_exc()[-1800:])
         raise
     finally:
@@ -133,6 +138,10 @@ def _run(project: Project, doc, ch, settings, ctrl: JobControl, progress, ai: AI
             rec["_parser"], rec["_ocr"], rec["_clip"] = PARSER_VERSION, opts.ocr_enabled, list(clip)
             atomic_write_json(cfile, rec)
         pages.append(rec)
+        nt = sum(1 for it in rec["items"] if it["t"] == "table")
+        nf = sum(1 for it in rec["items"] if it["t"] == "figure")
+        progress({"chapter": key, "stage": STAGES[3], "page": pno, "done": i, "total": total, "detail": f"{nt} table(s)"})
+        progress({"chapter": key, "stage": STAGES[4], "page": pno, "done": i, "total": total, "detail": f"{nf} figure(s)"})
         project.update_chapter_state(key, pages_done=i + 1, stage=STAGES[2], interrupted=False)
         progress({"chapter": key, "stage": STAGES[2], "page": pno, "done": i + 1, "total": total, "reused": reused})
     ctrl.checkpoint()
@@ -170,10 +179,8 @@ def _run(project: Project, doc, ch, settings, ctrl: JobControl, progress, ai: AI
     issues, metrics = qa.run_qa(chapter_d, working, blocks, text, table_files, built["removed"],
                                 list(range(ch.start, ch.end + 1)), ctx.issues, built["stats"])
     issues += _typo_issues(blocks)
-    issues += [Issue("LOW", "UNRESOLVED_XREF", f"Cross-reference not (yet) resolvable: {r.text}", b.page, b.id, "structure")
-               for b, r in unresolved if False]
-    for ent in entries:
-        pass
+    for err in sorted(set(ai.errors))[:3]:
+        issues.append(Issue("LOW", "AI_UNAVAILABLE", f"AI request failed ({err}); deterministic result used instead.", None, None, "structure"))
     issues.sort(key=lambda i: (SEV_RANK[i.severity], i.page or 0))
     status = status_from_issues(issues)
     # --------------------------------------------------------------- write outputs
@@ -183,6 +190,9 @@ def _run(project: Project, doc, ch, settings, ctrl: JobControl, progress, ai: AI
     atomic_write_json(root / "source_maps" / f"{key}.json", {
         "chapter": key, "chapter_number": ch.number, "chapter_title": ch.title, "markdown_file": f"chapters/{md_name}",
         "source_file": book["source_file_name"], "source_sha256": book["source_sha256"], "source_pages": [ch.start, ch.end],
+        "pages": {str(r["page"]): {"text_sha256": sha256_text("\n".join(it["raw"] for it in r["items"] if it["t"] == "line")),
+                                   "native_chars": r.get("native_chars", 0), "ocr": bool(r.get("ocr")), "size": [r["w"], r["h"]]}
+                  for r in pages},
         "generated": now_iso(), "parser_version": PARSER_VERSION, "sections": sections, "blocks": entries})
     ent_by_id = {e["block_id"]: e for e in entries}
     blocks_json = {
@@ -208,7 +218,6 @@ def _run(project: Project, doc, ch, settings, ctrl: JobControl, progress, ai: AI
                           "kind": r.kind, "label": r.label, "target_chapter": r.target_chapter})
     atomic_write_json(root / "metadata" / "unresolved_references.json", unres_all)
     # memory / vocab
-    local = set(built.get("running_local", []))
     mem["layout"]["body_size"] = built["stats"]["body"]
     mem["table_rules"]["last_strategy"] = Counter(t.get("strategy", "") for p in working for t in p["items"] if t["t"] == "table").most_common(1)
     project.save_memory(mem)
@@ -220,8 +229,8 @@ def _run(project: Project, doc, ch, settings, ctrl: JobControl, progress, ai: AI
     extra = {
         "version": f"textbook2md {APP_VERSION} / {PARSER_VERSION}", "blocks": len(blocks),
         "headings": sum(1 for b in blocks if b.type == "heading"), "sections": len(sections),
-        "removed": len(built["removed"]), "dehyphenated": sum(len(p.get("_dh", [])) for p in []) or _count_dh(blocks),
-        "kept_hyphen": 0, "pages_processed": len(pages), "pages_expected": total,
+        "removed": len(built["removed"]), "dehyphenated": built["join"]["dehyphenated"],
+        "kept_hyphen": built["join"]["kept"], "pages_processed": len(pages), "pages_expected": total,
         "scanned_pages": sum(1 for p in pages if p.get("scanned")), "ocr_pages": sum(1 for p in pages if p.get("ocr")),
         "unresolved": ch_unres}
     idicts = [i.to_dict() for i in issues]
@@ -235,10 +244,6 @@ def _run(project: Project, doc, ch, settings, ctrl: JobControl, progress, ai: AI
     resolve_pending(project)
     indexer.refresh_project_outputs(project, ai if ai.enabled else None)
     return project.chapter_state(key)
-
-
-def _count_dh(blocks) -> int:
-    return sum(1 for b in blocks if "hyphen" in " ".join(b.flags))
 
 
 def _typo_issues(blocks) -> list[Issue]:
@@ -262,7 +267,8 @@ def _ai_meta(ai: AIClient, chapter: dict, blocks, meta: dict) -> dict:
         sp = [str(x).lower() for x in r.get("specialty", [])][:3]
         tg = [str(x).lower() for x in r.get("tags", [])][:8]
         return {"specialty": sp or meta["specialty"], "tags": tg or meta["tags"]}
-    except Exception:
+    except Exception as e:
+        ai.errors.append(str(e))
         return meta
 
 

@@ -191,3 +191,34 @@ def test_chapter_and_rag_exports(converted, tmp_path):
     export.export_rag(converted, tmp_path / "r.zip")
     n = zipfile.ZipFile(tmp_path / "r.zip").namelist()
     assert "rag/chunks.jsonl" in n and "source_maps/ch_002.json" in n
+
+
+def test_ai_failure_degrades_gracefully_and_is_reported(book_pdf, tmp_path):
+    from textbook2md import ai as aimod
+    class Down(aimod.AIClient):
+        def __init__(self):
+            super().__init__({"ai_enabled": True, "provider": "openai", "openai_api_key": "k"})
+        def ask(self, purpose, system, user, max_chars=6000, retries=3):
+            raise aimod.AIError("openai: HTTP 429 rate limited")
+    p = service.create_project(book_pdf, tmp_path / "kb")
+    convert_chapter(p, "ch_001", {"ocr_enabled": True, "ai_enabled": True}, JobControl(), ai=Down())
+    iss = json.loads((p.hidden / "issues/ch_001.json").read_text())["issues"]
+    assert any(i["code"] == "AI_UNAVAILABLE" and "429" in i["message"] for i in iss)
+    assert p.chapter_state("ch_001")["status"].startswith("COMPLETED")        # deterministic output still produced
+
+
+def test_disk_full_is_actionable(book_pdf, tmp_path, monkeypatch):
+    import errno
+    from textbook2md import pipeline
+    p = service.create_project(book_pdf, tmp_path / "kb")
+    def boom(*a, **k):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(pipeline, "atomic_write_json", boom)
+    with pytest.raises(OSError):
+        convert_chapter(p, "ch_001", {"ocr_enabled": True}, JobControl())
+    assert "Disk full" in p.chapter_state("ch_001")["error"]
+
+
+def test_source_map_has_per_page_hashes(converted):
+    sm = json.loads((converted.root / "source_maps/ch_002.json").read_text())
+    assert set(sm["pages"]) == {"4", "5", "6", "7"} and all(len(v["text_sha256"]) == 64 for v in sm["pages"].values())

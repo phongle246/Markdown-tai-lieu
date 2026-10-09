@@ -394,8 +394,8 @@ def build_semantic_indexes(project, ai: AIClient | None = None) -> dict:
                         if term in heads:
                             s = next(x for x in secs if x["title"] == term)
                             cats[cat].append((term, c, f"{base}#{s.get('anchor', '')}", term))
-            except (AIError, AttributeError, TypeError):
-                pass
+            except (AIError, AttributeError, TypeError) as e:
+                ai.errors.append(str(e))
     titles = {"diseases": "Diseases & Conditions", "drugs": "Drugs", "signs_symptoms": "Signs & Symptoms", "topics": "Topics"}
     for cat, entries in cats.items():
         grouped: dict[str, list] = defaultdict(list)

@@ -1,6 +1,7 @@
 """Numeric fingerprinting: every number in the source must survive into the Markdown."""
 from __future__ import annotations
 
+import html
 import re
 import unicodedata
 from collections import Counter
@@ -40,7 +41,7 @@ def strip_markdown(md: str) -> str:
     t = t.replace("*", "")
     t = re.sub(r"^\s*-{3,}\s*$", " ", t, flags=re.M)      # GFM table delimiter rows / hr
     t = re.sub(r"^\s*:?-{2,}:?(?:\s*\|?\s*:?-{2,}:?)*\s*$", " ", t, flags=re.M)
-    return t
+    return html.unescape(t)               # HTML-table cells escape &lt; &amp;
 
 
 @dataclass

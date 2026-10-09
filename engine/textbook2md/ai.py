@@ -73,6 +73,7 @@ class AIClient:
         self.log_path = log_path
         self.requests = 0
         self.chars_sent = 0
+        self.errors: list[str] = []
 
     @property
     def enabled(self) -> bool:
@@ -172,6 +173,7 @@ def heading_classifier(client: AIClient):
             r = client.ask_json("heading_classification", SYS_HEADING,
                                 f"PREVIOUS: {prev}\nLINE: {text}\nNEXT: {nxt}", max_chars=600)
             return int(r.get("level", 3)) if r.get("heading") else None
-        except (AIError, ValueError, TypeError, AttributeError):
+        except (AIError, ValueError, TypeError, AttributeError) as e:
+            client.errors.append(str(e))
             return None
     return fn

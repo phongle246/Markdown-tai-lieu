@@ -3,6 +3,7 @@ tables and figures. Output is a JSON-serialisable page record that is checkpoint
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -74,6 +75,97 @@ def line_from_dict(ln: dict) -> dict | None:
         "size": round(size, 2), "bold": bold_chars / nchars >= 0.8, "italic": ital_chars / nchars >= 0.8,
         "font": dom["font"], "conf": 1.0, "ocr": False,
     }
+
+
+MARKER_ONLY = re.compile(r"^(?:[•·▪●◦○■▫‣⁃∙–—-]|\(?\d{1,3}[.)]|\(?[a-h][.)])$")
+
+
+def merge_marker_fragments(lines: list[dict]) -> list[dict]:
+    """List bullets/numbers are often drawn as their own text run (different font). Re-attach them to the
+    text that follows on the same row so list detection sees one line: '•' + 'Item text' → '• Item text'."""
+    out, used = [], set()
+    for i, a in enumerate(lines):
+        if i in used:
+            continue
+        if MARKER_ONLY.match(a["raw"].strip()):
+            ab = a["bbox"]
+            best = None
+            for j, b in enumerate(lines):
+                if j == i or j in used:
+                    continue
+                bb = b["bbox"]
+                ov = min(ab[3], bb[3]) - max(ab[1], bb[1])
+                if ov >= 0.5 * min(ab[3] - ab[1], bb[3] - bb[1]) and 0 <= bb[0] - ab[2] < 2.5 * max(a["size"], 8) \
+                        and not MARKER_ONLY.match(b["raw"].strip()):
+                    if best is None or bb[0] < lines[best]["bbox"][0]:
+                        best = j
+            if best is not None:
+                b = lines[best]
+                merged = dict(b)
+                merged["spans"] = [[a["raw"].strip() + " ", 0]] + b["spans"]
+                merged["raw"] = a["raw"].strip() + " " + b["raw"]
+                merged["bbox"] = [min(ab[0], b["bbox"][0]), min(ab[1], b["bbox"][1]), max(ab[2], b["bbox"][2]), max(ab[3], b["bbox"][3])]
+                used.add(best)
+                out.append(merged)
+                continue
+        out.append(a)
+    return out
+
+
+def _rows(lines: list[dict]) -> list[list[dict]]:
+    rows: list[list[dict]] = []
+    for l in sorted(lines, key=lambda l: (l["bbox"][1], l["bbox"][0])):
+        if rows:
+            ref = rows[-1][0]["bbox"]
+            h = max(ref[3] - ref[1], 1)
+            if abs((l["bbox"][1] + l["bbox"][3]) / 2 - (ref[1] + ref[3]) / 2) <= 0.4 * h:
+                rows[-1].append(l)
+                continue
+        rows.append([l])
+    return rows
+
+
+def assign_zones(lines: list[dict], H: float) -> None:
+    """Mark running-header / footer *candidates*: outermost rows that are visually detached from the body
+    (gap to the body ≥ 0.6 line heights, body-sized or smaller type) or sit in the extreme page margin."""
+    for l in lines:
+        l["zone"] = None
+    if not lines:
+        return
+    sizes = Counter(round(l["size"], 1) for l in lines for _ in range(len(l["raw"].strip())))
+    body = sizes.most_common(1)[0][0] if sizes else 10.0
+    rows = _rows(lines)
+    def geom(row):
+        return (min(l["bbox"][1] for l in row), max(l["bbox"][3] for l in row))
+    for rng, name in ((range(len(rows)), "top"), (range(len(rows) - 1, -1, -1), "bottom")):
+        for k in rng:
+            row = rows[k]
+            y0, y1 = geom(row)
+            h = max(y1 - y0, 1)
+            if max(l["size"] for l in row) > 1.15 * body:
+                break
+            if name == "top":
+                nxt = geom(rows[k + 1])[0] if k + 1 < len(rows) else None
+                gap = (nxt - y1) if nxt is not None else 99
+                ok = y1 < 0.065 * H or (y1 < 0.12 * H and gap >= 0.6 * h)
+            else:
+                prv = geom(rows[k - 1])[1] if k - 1 >= 0 else None
+                gap = (y0 - prv) if prv is not None else 99
+                ok = y0 > 0.935 * H or (y0 > 0.88 * H and gap >= 0.6 * h)
+            if not ok:
+                break
+            for l in row:
+                l["zone"] = name
+
+
+def reorder_page(rec: dict) -> None:
+    """Recompute column detection + reading order after zone flags changed (kept 'header/footer' lines)."""
+    items = rec["items"]
+    g = detect_gutter(items, rec["w"])
+    rec["gutter"] = round(g, 2) if g else None
+    rec["items"] = order_items(items, g)
+    for n, it in enumerate(rec["items"]):
+        it["order"] = n
 
 
 # ------------------------------------------------------------------------ column logic
@@ -486,9 +578,9 @@ def page_record(doc, pno: int, opts: LayoutOptions, img_dir: Path,
         lines = [l for l in lines if l["bbox"][1] >= y_lo - 2]
     if y_hi is not None:
         lines = [l for l in lines if l["bbox"][1] < y_hi - 2]
+    lines = merge_marker_fragments(lines)
+    assign_zones(lines, H)
     for l in lines:
-        yc = (l["bbox"][1] + l["bbox"][3]) / 2
-        l["zone"] = "top" if yc < H * ZONE_FRAC else ("bottom" if yc > H * (1 - ZONE_FRAC) else None)
         if has_encoding_artifacts(l["raw"]):
             rec["flags"].append("encoding_artifact")
     native_chars = sum(len(l["raw"].strip()) for l in lines if not l["zone"])

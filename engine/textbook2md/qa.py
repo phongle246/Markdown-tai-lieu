@@ -141,13 +141,8 @@ def run_qa(chapter: dict, pages: list[dict], blocks: list[Block], md_text: str, 
             add("LOW", "TABLE_HEADER_INFERRED", f"Table on page {b.page}: header row inferred (first row used).", b.page, b.id, "tables")
         if ex["kind"] == "html":
             add("LOW", "TABLE_HTML", f"Table on page {b.page} has merged cells/multi-row header; embedded as HTML.", b.page, b.id, "tables")
-    page_tables = {}
-    for p in pages:
-        for it in p["items"]:
-            if it["t"] == "table":
-                page_tables[p["page"]] = page_tables.get(p["page"], 0) + 1
-    if n_tables_src - len(tbl_blocks) > sum(1 for t in tbl_blocks if t.extra.get("complex") is None) + n_tables_src:  # never
-        pass
+    if n_tables_src and not tbl_blocks:
+        add("HIGH", "TABLE_COUNT", f"{n_tables_src} table(s) detected on the pages but none reached the Markdown.", cat="tables")
 
     # ---------- figures
     expected_figs = sum(1 for p in pages for it in p["items"] if it["t"] == "figure")

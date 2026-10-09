@@ -164,6 +164,10 @@ def join_span_lines(lines: list[list[Span]], vocab: Vocab | None = None,
             continue
         _rstrip(out)
         _lstrip(line)
+        if tail and tail in "\u2013\u2014/" and len(prev_text) > 1 and not prev_text[-2].isspace() and nxt_text \
+                and not nxt_text[0].isspace():
+            out.extend(line)            # typesetter broke after a dash/slash: no space existed in the source
+            continue
         out.append(Span(" ", out[-1].bits if out else 0))
         out.extend(line)
     return out

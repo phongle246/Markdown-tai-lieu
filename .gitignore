@@ -6,3 +6,4 @@ app/dist/
 src-tauri/target/
 *.egg-info/
 .t2md/
+src-tauri/gen/

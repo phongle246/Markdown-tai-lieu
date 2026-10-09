@@ -135,7 +135,12 @@ def chapter_payload(project: Project, key: str) -> dict:
         seg = "\n".join(lines[b["md_line_start"] - 1: b["md_line_end"]])
         blocks.append({**b, "markdown": seg})
     rep = project.root / "reports" / f"{key}_conversion_report.md"
-    return {"chapter": c.to_dict(), "markdown": text, "blocks": blocks, "issues": iss["issues"], "status": iss.get("status"),
+    sizes = {}
+    for n in range(c.start, c.end + 1):
+        rec = read_json(project.hidden / "pages" / key / f"p{n:05d}.json")
+        if rec:
+            sizes[n] = [rec["w"], rec["h"]]
+    return {"page_sizes": sizes, "chapter": c.to_dict(), "markdown": text, "blocks": blocks, "issues": iss["issues"], "status": iss.get("status"),
             "report": rep.read_text(encoding="utf-8") if rep.exists() else "", "sections": smap.get("sections", []),
             "markdown_file": smap.get("markdown_file")}
 
