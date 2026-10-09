@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+app/dist/
+src-tauri/target/
+*.egg-info/
+.t2md/
+src-tauri/gen/
